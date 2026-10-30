@@ -41,6 +41,8 @@ android {
     }
 
     defaultConfig {
+        // Keep the development fork installable next to the upstream com.termux app.
+        applicationId "com.termu2"
         minSdkVersion project.properties.minSdkVersion.toInteger()
         targetSdkVersion project.properties.targetSdkVersion.toInteger()
         versionCode 118
@@ -51,8 +53,8 @@ android {
 
         buildConfigField "String", "TERMUX_PACKAGE_VARIANT", "\"" + project.ext.packageVariant + "\"" // Used by TermuxApplication class
 
-        manifestPlaceholders.TERMUX_PACKAGE_NAME = "com.termux"
-        manifestPlaceholders.TERMUX_APP_NAME = "Termux"
+        manifestPlaceholders.TERMUX_PACKAGE_NAME = "com.termu2"
+        manifestPlaceholders.TERMUX_APP_NAME = "Termux Dev"
         manifestPlaceholders.TERMUX_API_APP_NAME = "Termux:API"
         manifestPlaceholders.TERMUX_BOOT_APP_NAME = "Termux:Boot"
         manifestPlaceholders.TERMUX_FLOAT_APP_NAME = "Termux:Float"
@@ -236,8 +238,82 @@ task downloadBootstraps() {
     }
 }
 
+def replaceBootstrapPackageName(byte[] bytes, byte[] oldPackageName, byte[] newPackageName) {
+    for (int i = 0; i <= bytes.length - oldPackageName.length; i++) {
+        boolean matches = true
+        for (int j = 0; j < oldPackageName.length; j++) {
+            if (bytes[i + j] != oldPackageName[j]) {
+                matches = false
+                break
+            }
+        }
+        if (matches) {
+            System.arraycopy(newPackageName, 0, bytes, i, newPackageName.length)
+            i += oldPackageName.length - 1
+        }
+    }
+    return bytes
+}
+
+/**
+ * Patch the downloaded bootstrap archives for the side-by-side development package. Termux
+ * bootstrap binaries embed the package path, so changing only the Android application id would
+ * install successfully but leave the shell pointing at the upstream package directory.
+ *
+ * The development package name intentionally has the same byte length as com.termux. This keeps
+ * the replacement safe for the embedded ELF/script path strings; an actual release fork must
+ * rebuild bootstrap packages from termux-packages instead.
+ */
+task patchDevelopmentBootstraps {
+    dependsOn downloadBootstraps
+    doLast {
+        byte[] oldPackageName = "com.termux".getBytes("US-ASCII")
+        byte[] newPackageName = "com.termu2".getBytes("US-ASCII")
+        if (oldPackageName.length != newPackageName.length) {
+            throw new GradleException("Development package name must have the same length as com.termux")
+        }
+
+        fileTree(new File(projectDir, "src/main/cpp")) {
+            include "bootstrap-*.zip"
+        }.each { File bootstrapFile ->
+            File patchedFile = new File(bootstrapFile.parentFile, bootstrapFile.name + ".patched")
+            java.util.zip.ZipFile input = new java.util.zip.ZipFile(bootstrapFile)
+            java.util.zip.ZipOutputStream output = new java.util.zip.ZipOutputStream(new FileOutputStream(patchedFile))
+            try {
+                input.entries().each { java.util.zip.ZipEntry entry ->
+                    byte[] contents = input.getInputStream(entry).bytes
+                    contents = replaceBootstrapPackageName(contents, oldPackageName, newPackageName)
+
+                    java.util.zip.ZipEntry patchedEntry = new java.util.zip.ZipEntry(entry.name)
+                    patchedEntry.time = entry.time
+                    if (entry.comment != null) patchedEntry.comment = entry.comment
+                    output.putNextEntry(patchedEntry)
+                    output.write(contents)
+                    output.closeEntry()
+                }
+            } finally {
+                output.close()
+                input.close()
+            }
+            java.nio.file.Files.move(
+                patchedFile.toPath(),
+                bootstrapFile.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING
+            )
+        }
+    }
+}
+
 afterEvaluate {
     android.applicationVariants.all { variant ->
-        variant.javaCompileProvider.get().dependsOn(downloadBootstraps)
+        variant.javaCompileProvider.get().dependsOn(patchDevelopmentBootstraps)
+    }
+
+    // The bootstrap ZIP is also embedded by ndk-build, so make sure the patch
+    // completes before native configure/build tasks are scheduled.
+    tasks.matching { task ->
+        task.name.startsWith("configureNdkBuild") || task.name.startsWith("buildNdkBuild")
+    }.configureEach {
+        dependsOn(patchDevelopmentBootstraps)
     }
 }

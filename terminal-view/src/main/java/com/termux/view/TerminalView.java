@@ -32,6 +32,7 @@ import android.view.autofill.AutofillValue;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Scroller;
 
 import androidx.annotation.Nullable;
@@ -40,6 +41,7 @@ import androidx.annotation.RequiresApi;
 import com.termux.terminal.KeyHandler;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
+import com.termux.terminal.WcWidth;
 import com.termux.view.textselection.TextSelectionCursorController;
 
 /** View displaying and interacting with a {@link TerminalSession}. */
@@ -85,6 +87,33 @@ public final class TerminalView extends View {
 
     /** If non-zero, this is the last unicode code point received if that was a combining character. */
     int mCombiningAccent;
+
+    /**
+     * Text currently being composed by the input method. Composing text is not echoed by the
+     * process running in the terminal until it is committed, so keep it as a visual preview in
+     * the terminal view.
+     */
+    private String mComposingText;
+
+    /** The input connection used to finish composing text before terminal key events. */
+    private BaseInputConnection mInputConnection;
+
+    /** Whether the composing preview is waiting for the terminal to echo committed input. */
+    private boolean mComposingTextCommitPending;
+
+    /** Cursor position before the committed preview was sent to the terminal. */
+    private int mComposingTextCommitStartRow = -1;
+    private int mComposingTextCommitStartColumn = -1;
+
+    /** Cursor position expected after the committed preview has been echoed. */
+    private int mComposingTextCommitExpectedRow = -1;
+    private int mComposingTextCommitExpectedColumn = -1;
+
+    /** Invalidates delayed callbacks belonging to an earlier composing-text commit. */
+    private long mComposingTextCommitGeneration;
+
+    /** Fallback for shells/keyboards that do not produce a screen update immediately after commit. */
+    private static final long COMPOSING_TEXT_COMMIT_TIMEOUT_MS = 750;
 
     /**
      * The current AutoFill type returned for {@link View#getAutofillType()} by {@link #getAutofillType()}.
@@ -293,6 +322,14 @@ public final class TerminalView extends View {
         mTermSession = session;
         mEmulator = null;
         mCombiningAccent = 0;
+        mComposingText = null;
+        mInputConnection = null;
+        mComposingTextCommitPending = false;
+        mComposingTextCommitStartRow = -1;
+        mComposingTextCommitStartColumn = -1;
+        mComposingTextCommitExpectedRow = -1;
+        mComposingTextCommitExpectedColumn = -1;
+        mComposingTextCommitGeneration++;
 
         // The emulator's cached value will be read in `updateSize()` when emulator is set.
         setTopRow(0, false);
@@ -340,15 +377,47 @@ public final class TerminalView extends View {
         // keyboard on Android TV (see https://github.com/termux/termux-app/issues/221).
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN;
 
-        return new BaseInputConnection(this, true) {
+        BaseInputConnection connection = new BaseInputConnection(this, true) {
+
+            @Override
+            public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
+                    mClient.logInfo(LOG_TAG, "IME: setComposingText(\"" + text + "\", " + newCursorPosition + ")");
+                }
+                boolean result = super.setComposingText(text, newCursorPosition);
+                if (text == null || text.length() == 0) {
+                    if (!mComposingTextCommitPending) mComposingText = null;
+                } else {
+                    mComposingText = text.toString();
+                    mComposingTextCommitPending = false;
+                    mComposingTextCommitGeneration++;
+                }
+                invalidate();
+                return result;
+            }
 
             @Override
             public boolean finishComposingText() {
                 if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: finishComposingText()");
+                // A few keyboards call finishComposingText() again while the previous commit is
+                // still waiting for the terminal echo. Do not resend that already committed word.
+                String previousComposingText = mComposingTextCommitPending ? null : mComposingText;
                 super.finishComposingText();
 
-                sendTextToTerminal(getEditable());
-                getEditable().clear();
+                Editable content = getEditable();
+                String textToSend = content.toString();
+                if (textToSend.length() == 0 && previousComposingText != null) {
+                    textToSend = previousComposingText;
+                }
+
+                if (previousComposingText != null && previousComposingText.length() > 0) {
+                    beginComposingTextCommit(textToSend);
+                } else {
+                    clearComposingTextPreview();
+                }
+
+                sendTextToTerminal(textToSend);
+                content.clear();
                 return true;
             }
 
@@ -357,12 +426,27 @@ public final class TerminalView extends View {
                 if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
                     mClient.logInfo(LOG_TAG, "IME: commitText(\"" + text + "\", " + newCursorPosition + ")");
                 }
+                // Treat a preview that is already pending terminal echo as committed state, not as
+                // a new composing buffer. A repeated callback must not write it twice.
+                String previousComposingText = mComposingTextCommitPending ? null : mComposingText;
                 super.commitText(text, newCursorPosition);
 
-                if (mEmulator == null) return true;
-
                 Editable content = getEditable();
-                sendTextToTerminal(content);
+                String textToSend = content.toString();
+                if (textToSend.length() == 0 && text != null) textToSend = text.toString();
+                if (textToSend.length() == 0 && previousComposingText != null) textToSend = previousComposingText;
+
+                // Some keyboards commit a whole gesture word without first leaving a composing
+                // span. Keep that word on screen for the same echo handoff as normal composition.
+                boolean hasComposingPreview = (previousComposingText != null && previousComposingText.length() > 0)
+                    || (text != null && text.length() > 1);
+                if (hasComposingPreview && textToSend.length() > 0) {
+                    beginComposingTextCommit(textToSend);
+                } else {
+                    clearComposingTextPreview();
+                }
+
+                sendTextToTerminal(textToSend);
                 content.clear();
                 return true;
             }
@@ -435,6 +519,9 @@ public final class TerminalView extends View {
             }
 
         };
+
+        mInputConnection = connection;
+        return connection;
     }
 
     @Override
@@ -458,6 +545,8 @@ public final class TerminalView extends View {
 
     public void onScreenUpdated(boolean skipScrolling) {
         if (mEmulator == null) return;
+
+        if (mComposingTextCommitPending && hasTerminalEchoedComposingText()) clearComposingTextPreview();
 
         int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) setTopRow(-rowsInHistory);
@@ -497,6 +586,125 @@ public final class TerminalView extends View {
 
         invalidate();
         if (mAccessibilityEnabled) setContentDescription(getText());
+    }
+
+    private void scheduleComposingTextCommitFallback() {
+        if (!mComposingTextCommitPending) return;
+
+        final long generation = mComposingTextCommitGeneration;
+        postDelayed(() -> {
+            if (generation == mComposingTextCommitGeneration && mComposingTextCommitPending) {
+                clearComposingTextPreview();
+            }
+        }, COMPOSING_TEXT_COMMIT_TIMEOUT_MS);
+    }
+
+    /**
+     * Finish an active IME composition before handling a terminal key event. Some keyboards keep
+     * their composing buffer outside of the editable and send Enter, arrows, or extra keys
+     * directly to the view. Finalizing here prevents the preview from being left behind at the
+     * next shell prompt.
+     */
+    private void finalizeComposingIfActive() {
+        if (mComposingText == null || mComposingText.length() == 0 || mComposingTextCommitPending) {
+            return;
+        }
+
+        if (mInputConnection == null) {
+            clearComposingTextPreview();
+            return;
+        }
+
+        Editable content = mInputConnection.getEditable();
+        if (content.length() == 0) content.append(mComposingText);
+        mInputConnection.finishComposingText();
+
+        // Samsung Keyboard can retain the composing buffer after finishComposingText(). Restart
+        // the input connection so that the next key event starts with a clean IME state.
+        post(() -> {
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) inputMethodManager.restartInput(TerminalView.this);
+        });
+    }
+
+    /** Keep the preview in place until the terminal has echoed the committed text. */
+    private void beginComposingTextCommit(String text) {
+        if (mEmulator == null || text == null || text.length() == 0) {
+            clearComposingTextPreview();
+            return;
+        }
+
+        mComposingText = text;
+        mComposingTextCommitPending = true;
+        mComposingTextCommitStartRow = mEmulator.getCursorRow();
+        mComposingTextCommitStartColumn = mEmulator.getCursorCol();
+        int[] expectedPosition = getComposingTextEndPosition(text, mComposingTextCommitStartRow,
+            mComposingTextCommitStartColumn);
+        mComposingTextCommitExpectedRow = expectedPosition[0];
+        mComposingTextCommitExpectedColumn = expectedPosition[1];
+        mComposingTextCommitGeneration++;
+        invalidate();
+        scheduleComposingTextCommitFallback();
+    }
+
+    private void clearComposingTextPreview() {
+        mComposingText = null;
+        mComposingTextCommitPending = false;
+        mComposingTextCommitStartRow = -1;
+        mComposingTextCommitStartColumn = -1;
+        mComposingTextCommitExpectedRow = -1;
+        mComposingTextCommitExpectedColumn = -1;
+        mComposingTextCommitGeneration++;
+        invalidate();
+    }
+
+    private boolean hasTerminalEchoedComposingText() {
+        if (mEmulator == null || mComposingTextCommitExpectedRow < 0) return false;
+
+        return mEmulator.getCursorRow() == mComposingTextCommitExpectedRow
+            && mEmulator.getCursorCol() == mComposingTextCommitExpectedColumn;
+    }
+
+    /** Calculate the cursor position after ordinary terminal echo of the committed text. */
+    private int[] getComposingTextEndPosition(String text, int startRow, int startColumn) {
+        int row = startRow;
+        int column = startColumn;
+        final int columns = Math.max(1, mEmulator.mColumns);
+
+        for (int i = 0; i < text.length(); i++) {
+            char firstChar = text.charAt(i);
+            int codePoint = firstChar;
+            if (Character.isHighSurrogate(firstChar) && i + 1 < text.length()
+                && Character.isLowSurrogate(text.charAt(i + 1))) {
+                codePoint = Character.toCodePoint(firstChar, text.charAt(++i));
+            }
+
+            if (codePoint == '\r' || codePoint == '\n') {
+                column = 0;
+                continue;
+            }
+            if (codePoint == '\b') {
+                if (column > 0) column--;
+                continue;
+            }
+
+            int codePointWidth = WcWidth.width(codePoint);
+            if (codePointWidth <= 0) continue;
+            if (column + codePointWidth > columns) {
+                row++;
+                column = 0;
+            }
+            column += codePointWidth;
+            if (column >= columns) {
+                row++;
+                column = 0;
+            }
+        }
+
+        // The emulator scrolls at the bottom instead of exposing a row beyond the viewport.
+        row = Math.min(row, Math.max(0, mEmulator.mRows - 1));
+        return new int[]{row, column};
     }
 
     /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}
@@ -771,6 +979,7 @@ public final class TerminalView extends View {
         if (TERMINAL_VIEW_KEY_LOGGING_ENABLED)
             mClient.logInfo(LOG_TAG, "onKeyDown(keyCode=" + keyCode + ", isSystem()=" + event.isSystem() + ", event=" + event + ")");
         if (mEmulator == null) return true;
+        if (!KeyEvent.isModifierKey(keyCode)) finalizeComposingIfActive();
         if (isSelectingText()) {
             stopTextSelectionMode();
         }
@@ -851,6 +1060,9 @@ public final class TerminalView extends View {
         }
 
         if (mTermSession == null) return;
+        if (!mComposingTextCommitPending && mComposingText != null && mComposingText.length() > 0) {
+            finalizeComposingIfActive();
+        }
 
         // Ensure cursor is shown when a key is pressed down like long hold on (arrow) keys
         if (mEmulator != null)
@@ -1033,7 +1245,21 @@ public final class TerminalView extends View {
 
             // render the text selection handles
             renderTextSelection();
+
+            // Render any in-progress IME text that has not been echoed by the terminal process yet.
+            renderComposingText(canvas);
         }
+    }
+
+    private void renderComposingText(Canvas canvas) {
+        if (mComposingText == null || mComposingText.length() == 0) return;
+        int cursorRow = mEmulator.getCursorRow();
+        int cursorColumn = mEmulator.getCursorCol();
+        if (mComposingTextCommitPending) {
+            cursorRow = mComposingTextCommitStartRow;
+            cursorColumn = mComposingTextCommitStartColumn;
+        }
+        mRenderer.renderComposingText(mEmulator, canvas, mTopRow, cursorRow, cursorColumn, mComposingText);
     }
 
     public TerminalSession getCurrentSession() {

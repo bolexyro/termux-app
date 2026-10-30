@@ -266,6 +266,76 @@ public final class TerminalRenderer {
         if (savedMatrix) canvas.restore();
     }
 
+    /**
+     * Draw text that is still being composed by the input method at the terminal cursor. The text
+     * has not reached the process running in the terminal yet, so it cannot be rendered by the
+     * normal terminal buffer path. It is underlined to distinguish the preview from terminal
+     * output and uses the style of the cursor cell for consistent colours and font metrics.
+     */
+    public void renderComposingText(TerminalEmulator mEmulator, Canvas canvas, int topRow, CharSequence text) {
+        if (mEmulator == null || text == null || text.length() == 0) return;
+
+        renderComposingText(mEmulator, canvas, topRow, mEmulator.getCursorRow(), mEmulator.getCursorCol(), text);
+    }
+
+    /** Draw a composing preview at a stable cursor position while committed input is echoing. */
+    public void renderComposingText(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+                                    int cursorRow, int cursorCol, CharSequence text) {
+        if (mEmulator == null || text == null || text.length() == 0) return;
+
+        final int visibleRow = cursorRow - topRow;
+        if (visibleRow < 0 || visibleRow >= mEmulator.mRows) return;
+
+        final char[] chars = text.toString().toCharArray();
+        int runWidthColumns = 0;
+        for (int i = 0; i < chars.length; ) {
+            final char firstChar = chars[i];
+            final int codePoint;
+            final int charsForCodePoint;
+            if (Character.isHighSurrogate(firstChar) && i + 1 < chars.length && Character.isLowSurrogate(chars[i + 1])) {
+                codePoint = Character.toCodePoint(firstChar, chars[i + 1]);
+                charsForCodePoint = 2;
+            } else {
+                codePoint = firstChar;
+                charsForCodePoint = 1;
+            }
+            final int codePointWidth = WcWidth.width(codePoint);
+            if (codePointWidth > 0) runWidthColumns += codePointWidth;
+            i += charsForCodePoint;
+        }
+        // Combining-only composition still needs one cell to cover the terminal cursor.
+        if (runWidthColumns == 0) runWidthColumns = 1;
+
+        final int[] palette = mEmulator.mColors.mCurrentColors;
+        final boolean reverseVideo = mEmulator.isReverseVideo();
+        final long style = mEmulator.getScreen().getStyleAt(cursorRow, cursorCol)
+            | TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+        final int effect = TextStyle.decodeEffect(style);
+
+        int backColor = TextStyle.decodeBackColor(style);
+        if ((backColor & 0xff000000) != 0xff000000) backColor = palette[backColor];
+        int foreColor = TextStyle.decodeForeColor(style);
+        if ((foreColor & 0xff000000) != 0xff000000) {
+            if ((effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0
+                    && foreColor >= 0 && foreColor < 8) foreColor += 8;
+            foreColor = palette[foreColor];
+        }
+        final boolean reverseVideoHere = reverseVideo ^ (effect & TextStyle.CHARACTER_ATTRIBUTE_INVERSE) != 0;
+        final int previewBackground = reverseVideoHere ? foreColor : backColor;
+
+        final float heightOffset = mFontLineSpacingAndAscent + (visibleRow + 1) * mFontLineSpacing;
+        final float left = cursorCol * mFontWidth;
+        final float measuredWidth = Math.max(mTextPaint.measureText(chars, 0, chars.length), mFontWidth);
+
+        // Cover the terminal cursor underneath the preview before drawing the composing text.
+        mTextPaint.setColor(previewBackground);
+        mTextPaint.setStyle(Paint.Style.FILL);
+        canvas.drawRect(left, heightOffset - mFontLineSpacing, left + runWidthColumns * mFontWidth, heightOffset, mTextPaint);
+
+        drawTextRun(canvas, chars, palette, heightOffset, cursorCol, runWidthColumns, 0, chars.length,
+            measuredWidth, 0, 0, style, reverseVideo);
+    }
+
     public float getFontWidth() {
         return mFontWidth;
     }
